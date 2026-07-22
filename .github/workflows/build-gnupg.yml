@@ -110,7 +110,7 @@ jobs:
             artifact_name: gnupg-windows-w64
             static: 0
 
-          # --- Windows 64-bit (纯 .exe 静态) ---
+          # --- Windows 64-bit (第三方依赖静态链接, 仅 exe) ---
           - os: ubuntu-latest
             name: windows-w64-static
             targetos: w32
@@ -153,20 +153,30 @@ jobs:
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
             echo "=== Windows 交叉编译 (${{ matrix.config.w32version }}, STATIC=${{ matrix.config.static }}) ==="
             STATIC_FLAG=""
-            NTBTLS_FLAG=""
-            PACKAGE_LIBS=""
             if [ "${{ matrix.config.static }}" = "1" ]; then
               STATIC_FLAG="STATIC=1"
-              NTBTLS_FLAG='speedo_pkg_ntbtls_configure=--disable-shared'
-              # Static libgpg-error.a references Winsock; libtool can't
-              # propagate through .a files. gnupg and pinentry both need it.
-              PACKAGE_LIBS='speedo_pkg_gnupg_make_args=LIBS=-lws2_32 speedo_pkg_pinentry_make_args=LIBS=-lws2_32'
+              # STATIC=1 only changes a subset of speedo.mk defaults. Override
+              # every bundled library and the zlib make-only build explicitly.
+              # Windows system API DLLs remain OS-provided imports; the
+              # post-build import check rejects redistributable DLLs.
+              printf '%s\n' \
+                'speedo_pkg_npth_configure = --enable-static --disable-shared' \
+                'speedo_pkg_libgpg_error_configure = --enable-static --disable-shared' \
+                'speedo_pkg_libassuan_configure = --enable-static --disable-shared' \
+                'speedo_pkg_libgcrypt_configure = --enable-static --disable-shared' \
+                'speedo_pkg_libksba_configure = --enable-static --disable-shared' \
+                'speedo_pkg_ntbtls_configure = --enable-static --disable-shared' \
+                'speedo_pkg_sqlite_configure = --enable-static --disable-shared' \
+                'speedo_pkg_zlib_make_args = -fwin32/Makefile.gcc PREFIX=$(host)- SHARED_MODE=0 LDFLAGS=-static-libgcc' \
+                'speedo_pkg_zlib_make_args_inst = -fwin32/Makefile.gcc BINARY_PATH=$(idir)/bin INCLUDE_PATH=$(idir)/include LIBRARY_PATH=$(idir)/lib SHARED_MODE=0' \
+                'speedo_pkg_gnupg_configure = --disable-g13 --enable-ntbtls --disable-tpm2d --disable-shared LDFLAGS="-static -static-libgcc" LIBS=-lws2_32' \
+                'speedo_pkg_pinentry_configure = --disable-pinentry-qt5 --disable-pinentry-qt --disable-pinentry-fltk --disable-pinentry-tty CPPFLAGS=-I$(idir)/include LDFLAGS="-L$(idir)/lib -static -static-libgcc -static-libstdc++" CXXFLAGS=-static-libstdc++ LIBS=-lws2_32' \
+                > config.mk
+              echo "=== 已写入 Windows 完全静态依赖配置 ==="
             fi
             make -f build-aux/speedo.mk \
               TARGETOS=w32 WHAT=release UPD_SWDB=1 ${STATIC_FLAG} \
               W32VERSION=${{ matrix.config.w32version }} \
-              ${NTBTLS_FLAG} \
-              ${PACKAGE_LIBS} \
               all
           else
             echo "=== Linux 静态编译 ==="
@@ -194,7 +204,40 @@ jobs:
           echo "=== 测试 gpg --version ==="
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
             file "${INST_DIR}/bin/gpg.exe"
-            echo "(Windows 交叉编译产物, 跳过本地运行测试)"
+            if [ "${{ matrix.config.static }}" = "1" ]; then
+              echo "=== 检查 Windows static PE 导入表 ==="
+              declare -A SYSTEM_DLLS=(
+                [advapi32.dll]=1 [avrt.dll]=1 [bcrypt.dll]=1
+                [comctl32.dll]=1 [comdlg32.dll]=1 [crypt32.dll]=1
+                [dnsapi.dll]=1 [dwmapi.dll]=1 [gdi32.dll]=1
+                [imm32.dll]=1 [iphlpapi.dll]=1 [kernel32.dll]=1
+                [mpr.dll]=1 [msvcrt.dll]=1 [ncrypt.dll]=1
+                [netapi32.dll]=1 [ntdll.dll]=1 [ole32.dll]=1
+                [oleacc.dll]=1 [oleaut32.dll]=1 [psapi.dll]=1
+                [rpcrt4.dll]=1 [secur32.dll]=1 [setupapi.dll]=1
+                [shell32.dll]=1 [shlwapi.dll]=1 [user32.dll]=1
+                [userenv.dll]=1 [version.dll]=1 [winhttp.dll]=1
+                [wininet.dll]=1 [winmm.dll]=1 [wldap32.dll]=1
+                [ws2_32.dll]=1
+              )
+              while IFS= read -r exe; do
+                echo "--- ${exe} ---"
+                imports=$(x86_64-w64-mingw32-objdump -p "${exe}" | awk '/DLL Name:/ {print tolower($3)}')
+                while IFS= read -r dll; do
+                  [ -n "${dll}" ] || continue
+                  case "${dll}" in
+                    api-ms-win-*.dll|ext-ms-win-*.dll) continue ;;
+                  esac
+                  if [ -z "${SYSTEM_DLLS["${dll}"]}" ]; then
+                    echo "ERROR: non-system DLL import in ${exe}: ${dll}"
+                    exit 1
+                  fi
+                done <<< "${imports}"
+              done < <(find "${INST_DIR}/bin" -maxdepth 1 -type f -iname '*.exe' | sort)
+              echo "Windows static PE 导入检查通过: 仅包含 Windows 系统 DLL"
+            else
+              echo "(Windows 交叉编译产物, 跳过本地运行测试)"
+            fi
           else
             export LD_LIBRARY_PATH="${INST_DIR}/lib:${LD_LIBRARY_PATH}"
             "${INST_DIR}/bin/gpg" --version
@@ -211,8 +254,13 @@ jobs:
 
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
             if [ "${{ matrix.config.static }}" = "1" ]; then
-              cp "${INST_DIR}/bin/"*.exe "${ARTIFACT}/bin/" 2>/dev/null || true
-              echo "Windows 静态产物 (仅 .exe):"
+              if find "${INST_DIR}/bin" -maxdepth 1 -type f -iname '*.dll' | grep -q .; then
+                echo "ERROR: Windows static build produced a DLL"
+                find "${INST_DIR}/bin" -maxdepth 1 -type f -iname '*.dll' -print
+                exit 1
+              fi
+              find "${INST_DIR}/bin" -maxdepth 1 -type f -iname '*.exe' -exec cp {} "${ARTIFACT}/bin/" \;
+              echo "Windows static 产物 (仅 exe):"
             else
               cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
               echo "Windows 产物 (含 DLL):"
@@ -330,8 +378,8 @@ jobs:
             | gnupg-linux-arm64.tar.xz | Linux ARM64 | 静态二进制 tar.xz |
             | gnupg-linux-arm64.deb | Linux ARM64 | Debian/Ubuntu .deb 包 |
             | gnupg-windows-w64.zip | Windows 64-bit | .exe + DLL |
-            | gnupg-windows-w64-static.zip | Windows 64-bit | 纯 .exe 静态（无 DLL） |
-
+            | gnupg-windows-w64-static.zip | Windows 64-bit | 第三方依赖静态链接（仅 exe） |
+              | gnupg-windows-w64-static.zip | Windows 64-bit | 第三方依赖静态链接（仅 exe） |
             构建时间：${{ steps.release-info.outputs.build_date }}
 
             ## English
@@ -357,7 +405,7 @@ jobs:
             | gnupg-linux-arm64.tar.xz | Linux ARM64 | Static binary tar.xz |
             | gnupg-linux-arm64.deb | Linux ARM64 | Debian/Ubuntu .deb package |
             | gnupg-windows-w64.zip | Windows 64-bit | .exe + DLL |
-            | gnupg-windows-w64-static.zip | Windows 64-bit | Static .exe only (no DLL) |
+            | gnupg-windows-w64-static.zip | Windows 64-bit | Third-party dependencies statically linked (exe only) |
 
             Build Date: ${{ steps.release-info.outputs.build_date }}
           artifacts: release-assets/*
