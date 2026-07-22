@@ -86,30 +86,37 @@ jobs:
     strategy:
       matrix:
         config:
-          # --- Linux amd64 (静态链接, 跨发行版可运行) ---
+          # --- Linux amd64 (静态链接, 跨发行版, +.deb) ---
           - os: ubuntu-latest
             name: linux-amd64
             targetos: native
-            suffix: .tar.xz
             artifact_name: gnupg-linux-amd64
+            deb_arch: amd64
             static: 1
 
-          # --- Linux ARM64 (原生 ARM runner) ---
+          # --- Linux ARM64 (原生 ARM, +.deb) ---
           - os: ubuntu-24.04-arm
             name: linux-arm64
             targetos: native
-            suffix: .tar.xz
             artifact_name: gnupg-linux-arm64
+            deb_arch: arm64
             static: 1
 
-          # --- Windows 64-bit (交叉编译) ---
+          # --- Windows 64-bit (含 DLL) ---
           - os: ubuntu-latest
             name: windows-w64
             targetos: w32
             w32version: w64
-            suffix: .zip
             artifact_name: gnupg-windows-w64
             static: 0
+
+          # --- Windows 64-bit (纯 .exe 静态) ---
+          - os: ubuntu-latest
+            name: windows-w64-static
+            targetos: w32
+            w32version: w64
+            artifact_name: gnupg-windows-w64-static
+            static: 1
       fail-fast: false
 
     runs-on: ${{ matrix.config.os }}
@@ -144,20 +151,22 @@ jobs:
         run: |
           cd "${GNUPG_SRCDIR}"
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
-            echo "=== Windows 交叉编译 (${{ matrix.config.w32version }}) ==="
-            make -f build-aux/speedo.mk \
-              TARGETOS=w32 WHAT=release UPD_SWDB=1 \
-              W32VERSION=${{ matrix.config.w32version }} all
-          else
-            echo "=== Linux 编译 ==="
+            echo "=== Windows 交叉编译 (${{ matrix.config.w32version }}, STATIC=${{ matrix.config.static }}) ==="
+            STATIC_FLAG=""
+            NTBTLS_FLAG=""
             if [ "${{ matrix.config.static }}" = "1" ]; then
-              # STATIC=1 覆盖了五个库的 --disable-shared,
-              # 但遗漏了 ntbtls; 命令行显式补齐.
-              make -f build-aux/speedo.mk native STATIC=1 \
-                speedo_pkg_ntbtls_configure="--disable-shared"
-            else
-              make -f build-aux/speedo.mk native
+              STATIC_FLAG="STATIC=1"
+              NTBTLS_FLAG='speedo_pkg_ntbtls_configure=--disable-shared'
             fi
+            make -f build-aux/speedo.mk \
+              TARGETOS=w32 WHAT=release UPD_SWDB=1 ${STATIC_FLAG} \
+              W32VERSION=${{ matrix.config.w32version }} \
+              ${NTBTLS_FLAG} \
+              all
+          else
+            echo "=== Linux 静态编译 ==="
+            make -f build-aux/speedo.mk native STATIC=1 \
+              speedo_pkg_ntbtls_configure="--disable-shared"
           fi
 
       - name: 检测并测试构建产物
@@ -176,7 +185,6 @@ jobs:
           echo "=== 测试 gpg --version ==="
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
             file "${INST_DIR}/bin/gpg.exe"
-            # MinGW 交叉编译的 .exe 无法在 Linux 直接运行
             echo "(Windows 交叉编译产物, 跳过本地运行测试)"
           else
             export LD_LIBRARY_PATH="${INST_DIR}/lib:${LD_LIBRARY_PATH}"
@@ -191,20 +199,51 @@ jobs:
           INST_DIR="${GNUPG_SRCDIR}/PLAY/inst"
           rm -rf "${ARTIFACT}"
           mkdir -p "${ARTIFACT}/bin"
-          cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
-          [ -d "${INST_DIR}/lib" ] && cp -a "${INST_DIR}/lib" "${ARTIFACT}/" || true
+
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
-            cd "${ARTIFACT}" && zip -9qr "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}" .
+            if [ "${{ matrix.config.static }}" = "1" ]; then
+              # 静态: 只取 .exe, 无 DLL
+              cp "${INST_DIR}/bin/"*.exe "${ARTIFACT}/bin/" 2>/dev/null || true
+              echo "Windows 静态产物 (仅 .exe):"
+            else
+              # 完整: .exe + DLL
+              cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
+              echo "Windows 产物 (含 DLL):"
+            fi
+            ls -lh "${ARTIFACT}/bin/"
+            cd "${ARTIFACT}" && zip -9qr "${GITHUB_WORKSPACE}/${ARTIFACT}.zip" .
           else
-            cd "${ARTIFACT}" && tar -cJf "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}" .
+            # Linux: tar.xz
+            cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
+            cd "${ARTIFACT}" && tar -cJf "${GITHUB_WORKSPACE}/${ARTIFACT}.tar.xz" .
+            ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}.tar.xz"
+
+            # Linux: .deb 包
+            echo "=== 生成 .deb 包 ==="
+            VERSION="${{ needs.check-version.outputs.raw_version }}"
+            DEB_DIR="${ARTIFACT}-deb"
+            mkdir -p "${DEB_DIR}/DEBIAN" "${DEB_DIR}/usr/local/bin"
+            cat > "${DEB_DIR}/DEBIAN/control" <<CTRL
+            Package: gnupg
+            Version: ${VERSION}
+            Architecture: ${{ matrix.config.deb_arch }}
+            Maintainer: github-actions@github.com
+            Description: GnuPG - GNU Privacy Guard (statically linked)
+             GnuPG is a complete and free implementation of the OpenPGP standard.
+             Statically linked, works on any Linux distribution.
+            CTRL
+            sed -i 's/^            //' "${DEB_DIR}/DEBIAN/control"
+            cp "${INST_DIR}/bin/"* "${DEB_DIR}/usr/local/bin/"
+            dpkg-deb --build "${DEB_DIR}"
+            mv "${DEB_DIR}.deb" "${GITHUB_WORKSPACE}/${ARTIFACT}.deb"
+            ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}.deb"
           fi
-          ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}"
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.config.artifact_name }}
-          path: ${{ matrix.config.artifact_name }}${{ matrix.config.suffix }}
+          path: ${{ matrix.config.artifact_name }}*
 
   # ========== Job 3: 创建 Release ==========
   create-release:
@@ -275,11 +314,14 @@ jobs:
             - **keyboxd** — 密钥盒守护进程
 
             ### 构建平台
-            | 文件名 | 架构 | 构建环境 |
+            | 文件名 | 架构 | 类型 |
             |---|---|---|
-            | gnupg-linux-amd64.tar.xz | Linux x86_64 (静态链接) | Ubuntu 24.04 |
-            | gnupg-linux-arm64.tar.xz | Linux ARM64 (静态链接) | Ubuntu 24.04 ARM |
-            | gnupg-windows-w64.zip | Windows 64-bit | Ubuntu + MinGW-w64 |
+            | gnupg-linux-amd64.tar.xz | Linux x86_64 | 静态二进制 tar.xz |
+            | gnupg-linux-amd64.deb | Linux x86_64 | Debian/Ubuntu .deb 包 |
+            | gnupg-linux-arm64.tar.xz | Linux ARM64 | 静态二进制 tar.xz |
+            | gnupg-linux-arm64.deb | Linux ARM64 | Debian/Ubuntu .deb 包 |
+            | gnupg-windows-w64.zip | Windows 64-bit | .exe + DLL |
+            | gnupg-windows-w64-static.zip | Windows 64-bit | 纯 .exe 静态（无 DLL） |
 
             构建时间：${{ steps.release-info.outputs.build_date }}
 
@@ -299,11 +341,14 @@ jobs:
             - **keyboxd** — Keybox daemon
 
             ### Build Platforms
-            | File Name | Architecture | Build Environment |
+            | File Name | Architecture | Type |
             |---|---|---|
-            | gnupg-linux-amd64.tar.xz | Linux x86_64 (statically linked) | Ubuntu 24.04 |
-            | gnupg-linux-arm64.tar.xz | Linux ARM64 (statically linked) | Ubuntu 24.04 ARM |
-            | gnupg-windows-w64.zip | Windows 64-bit | Ubuntu + MinGW-w64 |
+            | gnupg-linux-amd64.tar.xz | Linux x86_64 | Static binary tar.xz |
+            | gnupg-linux-amd64.deb | Linux x86_64 | Debian/Ubuntu .deb package |
+            | gnupg-linux-arm64.tar.xz | Linux ARM64 | Static binary tar.xz |
+            | gnupg-linux-arm64.deb | Linux ARM64 | Debian/Ubuntu .deb package |
+            | gnupg-windows-w64.zip | Windows 64-bit | .exe + DLL |
+            | gnupg-windows-w64-static.zip | Windows 64-bit | Static .exe only (no DLL) |
 
             Build Date: ${{ steps.release-info.outputs.build_date }}
           artifacts: release-assets/*
