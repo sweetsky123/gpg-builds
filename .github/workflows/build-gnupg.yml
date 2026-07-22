@@ -1,0 +1,313 @@
+name: GnuPG 自动构建
+
+on:
+  schedule:
+    # 每天 UTC 0:00 = 北京时间 8:00
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  # ========== Job 1: 检查版本 ==========
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      raw_version: ${{ steps.version.outputs.raw }}
+      should_build: ${{ steps.should_build.outputs.value }}
+    steps:
+      - name: 检查分支
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 爬取 GnuPG 官网获取最新稳定版版本号
+        id: version
+        run: |
+          python .github/scripts/check_version.py > version_info.json
+          cat version_info.json
+          RAW_VERSION=$(python -c "import json; print(json.load(open('version_info.json'))['version'])")
+          echo "value=v${RAW_VERSION}" >> $GITHUB_OUTPUT
+          echo "raw=${RAW_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: 检查 Tag 是否存在
+        id: check-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.value }}"
+          if gh api "repos/${{ github.repository }}/git/ref/tags/${TAG}" --jq '.ref' 2>/dev/null; then
+            echo "Tag ${TAG} 已存在"
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag ${TAG} 不存在"
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 检查 Release 是否有 Asset
+        id: check-assets
+        if: steps.check-tag.outputs.tag_exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version.outputs.value }}"
+          ASSET_COUNT=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" --jq '.assets | length' 2>/dev/null || echo "0")
+          echo "Asset 数量: ${ASSET_COUNT}"
+          if [ "${ASSET_COUNT}" -gt 0 ]; then
+            echo "Release 已有构建产物，跳过构建"
+            echo "has_assets=true" >> $GITHUB_OUTPUT
+          else
+            echo "Release 没有构建产物，需要构建"
+            echo "has_assets=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 判断是否需要构建
+        id: should_build
+        run: |
+          if [ "${{ steps.check-tag.outputs.tag_exists }}" = "false" ] \
+             || [ "${{ steps.check-assets.outputs.has_assets }}" = "false" ]; then
+            echo "需要构建"
+            echo "value=true" >> $GITHUB_OUTPUT
+          else
+            echo "无需构建"
+            echo "value=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ========== Job 2: 多平台并行构建 ==========
+  build:
+    needs: check-version
+    if: ${{ needs.check-version.outputs.should_build == 'true' }}
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        config:
+          # --- Linux amd64 (静态链接, 跨发行版可运行) ---
+          - os: ubuntu-latest
+            name: linux-amd64
+            targetos: native
+            suffix: .tar.xz
+            artifact_name: gnupg-linux-amd64
+            static: 1
+
+          # --- Linux ARM64 (原生 ARM runner) ---
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+            targetos: native
+            suffix: .tar.xz
+            artifact_name: gnupg-linux-arm64
+            static: 1
+
+          # --- Windows 64-bit (交叉编译) ---
+          - os: ubuntu-latest
+            name: windows-w64
+            targetos: w32
+            w32version: w64
+            suffix: .zip
+            artifact_name: gnupg-windows-w64
+            static: 0
+      fail-fast: false
+
+    runs-on: ${{ matrix.config.os }}
+    name: 构建 ${{ matrix.config.name }}
+
+    steps:
+      - name: 下载 GnuPG ${{ needs.check-version.outputs.version }} 源码
+        run: |
+          RAW_VERSION="${{ needs.check-version.outputs.raw_version }}"
+          URL="https://www.gnupg.org/ftp/gcrypt/gnupg/gnupg-${RAW_VERSION}.tar.bz2"
+          echo "正在从 ${URL} 下载..."
+          curl -fSL -o "gnupg-${RAW_VERSION}.tar.bz2" "${URL}"
+          echo "解压源码..."
+          tar -xjf "gnupg-${RAW_VERSION}.tar.bz2"
+          echo "GNUPG_SRCDIR=${GITHUB_WORKSPACE}/gnupg-${RAW_VERSION}" >> $GITHUB_ENV
+
+      - name: 安装构建依赖 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            make autoconf automake libtool \
+            gettext texinfo wget \
+            bzip2 xz-utils
+
+      - name: 安装 MinGW 交叉编译工具链 (Windows 交叉编译)
+        if: matrix.config.targetos == 'w32'
+        run: |
+          sudo apt-get install -y mingw-w64
+
+      - name: 构建 GnuPG (${{ matrix.config.name }})
+        run: |
+          cd "${GNUPG_SRCDIR}"
+          if [ "${{ matrix.config.targetos }}" = "w32" ]; then
+            echo "=== Windows 交叉编译 (${{ matrix.config.w32version }}) ==="
+            make -f build-aux/speedo.mk \
+              TARGETOS=w32 WHAT=release UPD_SWDB=1 \
+              W32VERSION=${{ matrix.config.w32version }} all
+          else
+            echo "=== Linux 编译 ==="
+            if [ "${{ matrix.config.static }}" = "1" ]; then
+              # STATIC=1 覆盖了五个库的 --disable-shared,
+              # 但遗漏了 ntbtls; 命令行显式补齐.
+              make -f build-aux/speedo.mk native STATIC=1 \
+                speedo_pkg_ntbtls_configure="--disable-shared"
+            else
+              make -f build-aux/speedo.mk native
+            fi
+          fi
+
+      - name: 检测并测试构建产物
+        id: check-binaries
+        run: |
+          INST_DIR="${GNUPG_SRCDIR}/PLAY/inst"
+          if [ ! -d "${INST_DIR}/bin" ]; then
+            echo "ERROR: 未找到构建产物目录 ${INST_DIR}/bin!"
+            exit 1
+          fi
+          echo "构建产物列表:"
+          find "${INST_DIR}/bin" -type f -executable | sort
+          echo "found=true" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "=== 测试 gpg --version ==="
+          if [ "${{ matrix.config.targetos }}" = "w32" ]; then
+            file "${INST_DIR}/bin/gpg.exe"
+            # MinGW 交叉编译的 .exe 无法在 Linux 直接运行
+            echo "(Windows 交叉编译产物, 跳过本地运行测试)"
+          else
+            export LD_LIBRARY_PATH="${INST_DIR}/lib:${LD_LIBRARY_PATH}"
+            "${INST_DIR}/bin/gpg" --version
+            echo ""
+            "${INST_DIR}/bin/gpg" --list-config || true
+          fi
+
+      - name: 打包构建产物
+        run: |
+          ARTIFACT="${{ matrix.config.artifact_name }}"
+          INST_DIR="${GNUPG_SRCDIR}/PLAY/inst"
+          rm -rf "${ARTIFACT}"
+          mkdir -p "${ARTIFACT}/bin"
+          cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
+          [ -d "${INST_DIR}/lib" ] && cp -a "${INST_DIR}/lib" "${ARTIFACT}/" || true
+          if [ "${{ matrix.config.targetos }}" = "w32" ]; then
+            cd "${ARTIFACT}" && zip -9qr "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}" .
+          else
+            cd "${ARTIFACT}" && tar -cJf "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}" .
+          fi
+          ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}"
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.config.artifact_name }}
+          path: ${{ matrix.config.artifact_name }}${{ matrix.config.suffix }}
+
+  # ========== Job 3: 创建 Release ==========
+  create-release:
+    needs: [check-version, build]
+    if: ${{ always() && needs.check-version.result == 'success' && needs.check-version.outputs.should_build == 'true' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 检查分支
+        uses: actions/checkout@v4
+
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+
+      - name: 生成 Release 信息
+        id: release-info
+        run: |
+          VERSION="${{ needs.check-version.outputs.version }}"
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+
+      - name: 创建 Git Tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.check-version.outputs.version }}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -f "${TAG}"
+          git push origin "${TAG}" --force
+
+      - name: 打包所有产物到 Release
+        run: |
+          mkdir -p release-assets
+          for dir in gnupg-*; do
+            if [ -d "$dir" ]; then
+              file=$(find "$dir" -type f | head -1)
+              if [ -n "$file" ]; then
+                cp "$file" release-assets/
+                ls -lh "$file"
+              fi
+            fi
+          done
+          echo "Release 产物列表:"
+          ls -lh release-assets/
+
+      - name: 创建 GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.release-info.outputs.version }}
+          name: GnuPG ${{ steps.release-info.outputs.version }}
+          body: |
+            ## 中文
+
+            通过 GitHub Actions 自动从 GnuPG 官网抓取安装包并完成构建。
+
+            ### 包含文件
+            - **gpg** — GnuPG 核心加密工具
+            - **gpg-agent** — GPG 代理（私钥缓存）
+            - **gpgconf** — 配置工具
+            - **gpgsm** — S/MIME 支持
+            - **gpgv** — 签名验证工具
+            - **gpgtar** — 加密归档工具
+            - **gpg-card** — OpenPGP 卡片管理
+            - **dirmngr** — 证书目录管理器
+            - **keyboxd** — 密钥盒守护进程
+
+            ### 构建平台
+            | 文件名 | 架构 | 构建环境 |
+            |---|---|---|
+            | gnupg-linux-amd64.tar.xz | Linux x86_64 (静态链接) | Ubuntu 24.04 |
+            | gnupg-linux-arm64.tar.xz | Linux ARM64 (静态链接) | Ubuntu 24.04 ARM |
+            | gnupg-windows-w64.zip | Windows 64-bit | Ubuntu + MinGW-w64 |
+
+            构建时间：${{ steps.release-info.outputs.build_date }}
+
+            ## English
+
+            Use GitHub Actions to automatically retrieve the GnuPG installer from its official site and perform the build.
+
+            ### Included Files
+            - **gpg** — Core GnuPG encryption tool
+            - **gpg-agent** — GPG agent (private key cache)
+            - **gpgconf** — Configuration tool
+            - **gpgsm** — S/MIME support
+            - **gpgv** — Signature verification tool
+            - **gpgtar** — Encrypted archive tool
+            - **gpg-card** — OpenPGP card management
+            - **dirmngr** — Certificate directory manager
+            - **keyboxd** — Keybox daemon
+
+            ### Build Platforms
+            | File Name | Architecture | Build Environment |
+            |---|---|---|
+            | gnupg-linux-amd64.tar.xz | Linux x86_64 (statically linked) | Ubuntu 24.04 |
+            | gnupg-linux-arm64.tar.xz | Linux ARM64 (statically linked) | Ubuntu 24.04 ARM |
+            | gnupg-windows-w64.zip | Windows 64-bit | Ubuntu + MinGW-w64 |
+
+            Build Date: ${{ steps.release-info.outputs.build_date }}
+          artifacts: release-assets/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
+          makeLatest: true
