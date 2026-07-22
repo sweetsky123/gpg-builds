@@ -1,0 +1,46 @@
+name: 自动清理 Artifacts
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  cleanup:
+    name: 清理超过 24 小时的 Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: 删除过期 Artifacts
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+
+            let deleted = 0;
+            for (const artifact of artifacts) {
+              if (new Date(artifact.created_at).getTime() > cutoff) {
+                continue;
+              }
+
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+              deleted++;
+              core.info(`Deleted artifact ${artifact.name} (${artifact.id}) created at ${artifact.created_at}`);
+            }
+
+            core.info(`Deleted ${deleted} artifact(s) older than 24 hours.`);
