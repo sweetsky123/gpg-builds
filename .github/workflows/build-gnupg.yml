@@ -223,16 +223,15 @@ jobs:
             VERSION="${{ needs.check-version.outputs.raw_version }}"
             DEB_DIR="${ARTIFACT}-deb"
             mkdir -p "${DEB_DIR}/DEBIAN" "${DEB_DIR}/usr/local/bin"
-            cat > "${DEB_DIR}/DEBIAN/control" <<CTRL
-            Package: gnupg
-            Version: ${VERSION}
-            Architecture: ${{ matrix.config.deb_arch }}
-            Maintainer: github-actions@github.com
-            Description: GnuPG - GNU Privacy Guard (statically linked)
-             GnuPG is a complete and free implementation of the OpenPGP standard.
-             Statically linked, works on any Linux distribution.
-            CTRL
-            sed -i 's/^            //' "${DEB_DIR}/DEBIAN/control"
+            printf '%s\n' \
+              "Package: gnupg" \
+              "Version: ${VERSION}" \
+              "Architecture: ${{ matrix.config.deb_arch }}" \
+              "Maintainer: github-actions@github.com" \
+              "Description: GnuPG - GNU Privacy Guard (statically linked)" \
+              " GnuPG is a complete and free implementation of the OpenPGP standard." \
+              " Statically linked, works on any Linux distribution." \
+              > "${DEB_DIR}/DEBIAN/control"
             cp "${INST_DIR}/bin/"* "${DEB_DIR}/usr/local/bin/"
             dpkg-deb --build "${DEB_DIR}"
             mv "${DEB_DIR}.deb" "${GITHUB_WORKSPACE}/${ARTIFACT}.deb"
