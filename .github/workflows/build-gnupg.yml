@@ -3,7 +3,7 @@ name: GnuPG 自动构建
 on:
   schedule:
     # 每天 UTC 0:00 = 北京时间 8:00
-    - cron: '0 3 * * *'
+    - cron: '0 4 * * *'
   workflow_dispatch:
 
 env:
@@ -19,10 +19,10 @@ jobs:
       should_build: ${{ steps.should_build.outputs.value }}
     steps:
       - name: 检查分支
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -201,7 +201,7 @@ jobs:
           ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}${{ matrix.config.suffix }}"
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.config.artifact_name }}
           path: ${{ matrix.config.artifact_name }}${{ matrix.config.suffix }}
@@ -215,10 +215,10 @@ jobs:
       contents: write
     steps:
       - name: 检查分支
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 下载所有构建产物
-        uses: actions/download-artifact@v4
+        uses: actions/upload-artifact@v7
 
       - name: 生成 Release 信息
         id: release-info
