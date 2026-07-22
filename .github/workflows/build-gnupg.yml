@@ -169,8 +169,10 @@ jobs:
                 'speedo_pkg_sqlite_configure = --enable-static --disable-shared' \
                 'speedo_pkg_zlib_make_args = -fwin32/Makefile.gcc PREFIX=$(host)- SHARED_MODE=0 LDFLAGS=-static-libgcc' \
                 'speedo_pkg_zlib_make_args_inst = -fwin32/Makefile.gcc BINARY_PATH=$(idir)/bin INCLUDE_PATH=$(idir)/include LIBRARY_PATH=$(idir)/lib SHARED_MODE=0' \
-                'speedo_pkg_gnupg_configure = --disable-g13 --enable-ntbtls --disable-tpm2d --disable-shared LDFLAGS="-static -static-libgcc" LIBS=-lws2_32' \
-                'speedo_pkg_pinentry_configure = --disable-pinentry-qt5 --disable-pinentry-qt --disable-pinentry-fltk --disable-pinentry-tty CPPFLAGS=-I$(idir)/include LDFLAGS="-L$(idir)/lib -static -static-libgcc -static-libstdc++" CXXFLAGS=-static-libstdc++ LIBS=-lws2_32' \
+                'speedo_pkg_gnupg_configure = --disable-g13 --enable-ntbtls --disable-tpm2d --disable-shared LDFLAGS=-static LIBS=-lws2_32' \
+                'speedo_pkg_gnupg_make_args = LDFLAGS="-static -static-libgcc -static-libstdc++" LIBS=-lws2_32' \
+                'speedo_pkg_pinentry_configure = --disable-pinentry-qt5 --disable-pinentry-qt --disable-pinentry-fltk --disable-pinentry-tty CPPFLAGS=-I$(idir)/include LDFLAGS=-L$(idir)/lib CXXFLAGS=-static-libstdc++' \
+                'speedo_pkg_pinentry_make_args = LDFLAGS="-L$(idir)/lib -static -static-libgcc -static-libstdc++" LIBS=-lws2_32' \
                 > config.mk
               echo "=== 已写入 Windows 完全静态依赖配置 ==="
             fi
@@ -379,7 +381,6 @@ jobs:
             | gnupg-linux-arm64.deb | Linux ARM64 | Debian/Ubuntu .deb 包 |
             | gnupg-windows-w64.zip | Windows 64-bit | .exe + DLL |
             | gnupg-windows-w64-static.zip | Windows 64-bit | 第三方依赖静态链接（仅 exe） |
-              | gnupg-windows-w64-static.zip | Windows 64-bit | 第三方依赖静态链接（仅 exe） |
             构建时间：${{ steps.release-info.outputs.build_date }}
 
             ## English
