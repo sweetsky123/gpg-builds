@@ -154,22 +154,19 @@ jobs:
             echo "=== Windows 交叉编译 (${{ matrix.config.w32version }}, STATIC=${{ matrix.config.static }}) ==="
             STATIC_FLAG=""
             NTBTLS_FLAG=""
-            GNUPG_LDFLAGS=""
+            PACKAGE_LIBS=""
             if [ "${{ matrix.config.static }}" = "1" ]; then
               STATIC_FLAG="STATIC=1"
               NTBTLS_FLAG='speedo_pkg_ntbtls_configure=--disable-shared'
-              # Static libgpg-error.a references Winsock symbols
-              # (inet_addr, socket, connect, closesocket) that
-              # libtool can't propagate through .a files.
-              # gnupg configure.ac already sets W32SOCKLIBS=-lws2_32
-              # for dynamic builds; for static, pass it explicitly.
-              GNUPG_LDFLAGS='speedo_pkg_gnupg_make_args=LIBS=-lws2_32'
+              # Static libgpg-error.a references Winsock; libtool can't
+              # propagate through .a files. gnupg and pinentry both need it.
+              PACKAGE_LIBS='speedo_pkg_gnupg_make_args=LIBS=-lws2_32 speedo_pkg_pinentry_make_args=LIBS=-lws2_32'
             fi
             make -f build-aux/speedo.mk \
               TARGETOS=w32 WHAT=release UPD_SWDB=1 ${STATIC_FLAG} \
               W32VERSION=${{ matrix.config.w32version }} \
               ${NTBTLS_FLAG} \
-              ${GNUPG_LDFLAGS} \
+              ${PACKAGE_LIBS} \
               all
           else
             echo "=== Linux 静态编译 ==="
@@ -186,7 +183,11 @@ jobs:
             exit 1
           fi
           echo "构建产物列表:"
-          find "${INST_DIR}/bin" -type f -executable | sort
+          if [ "${{ matrix.config.targetos }}" = "w32" ]; then
+            find "${INST_DIR}/bin" -type f | sort
+          else
+            find "${INST_DIR}/bin" -type f -executable | sort
+          fi
           echo "found=true" >> $GITHUB_OUTPUT
 
           echo ""
@@ -205,26 +206,26 @@ jobs:
         run: |
           ARTIFACT="${{ matrix.config.artifact_name }}"
           INST_DIR="${GNUPG_SRCDIR}/PLAY/inst"
-          rm -rf "${ARTIFACT}"
+          rm -rf "${ARTIFACT}" "${ARTIFACT}-deb"
           mkdir -p "${ARTIFACT}/bin"
 
           if [ "${{ matrix.config.targetos }}" = "w32" ]; then
             if [ "${{ matrix.config.static }}" = "1" ]; then
-              # 静态: 只取 .exe, 无 DLL
               cp "${INST_DIR}/bin/"*.exe "${ARTIFACT}/bin/" 2>/dev/null || true
               echo "Windows 静态产物 (仅 .exe):"
             else
-              # 完整: .exe + DLL
               cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
               echo "Windows 产物 (含 DLL):"
             fi
             ls -lh "${ARTIFACT}/bin/"
             cd "${ARTIFACT}" && zip -9qr "${GITHUB_WORKSPACE}/${ARTIFACT}.zip" .
+            cd "${GITHUB_WORKSPACE}" && rm -rf "${ARTIFACT}"
           else
             # Linux: tar.xz
             cp "${INST_DIR}/bin/"* "${ARTIFACT}/bin/" 2>/dev/null || true
             cd "${ARTIFACT}" && tar -cJf "${GITHUB_WORKSPACE}/${ARTIFACT}.tar.xz" .
             ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}.tar.xz"
+            cd "${GITHUB_WORKSPACE}" && rm -rf "${ARTIFACT}"
 
             # Linux: .deb 包
             echo "=== 生成 .deb 包 ==="
@@ -244,13 +245,14 @@ jobs:
             dpkg-deb --build "${DEB_DIR}"
             mv "${DEB_DIR}.deb" "${GITHUB_WORKSPACE}/${ARTIFACT}.deb"
             ls -lh "${GITHUB_WORKSPACE}/${ARTIFACT}.deb"
+            rm -rf "${DEB_DIR}"
           fi
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.config.artifact_name }}
-          path: ${{ matrix.config.artifact_name }}*
+          path: ${{ github.workspace }}/${{ matrix.config.artifact_name }}.*
 
   # ========== Job 3: 创建 Release ==========
   create-release:
@@ -289,11 +291,11 @@ jobs:
           mkdir -p release-assets
           for dir in gnupg-*; do
             if [ -d "$dir" ]; then
-              file=$(find "$dir" -type f | head -1)
-              if [ -n "$file" ]; then
+              find "$dir" -type f | while read -r file; do
+                [ -f "$file" ] || continue
                 cp "$file" release-assets/
                 ls -lh "$file"
-              fi
+              done
             fi
           done
           echo "Release 产物列表:"
