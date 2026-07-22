@@ -154,14 +154,22 @@ jobs:
             echo "=== Windows 交叉编译 (${{ matrix.config.w32version }}, STATIC=${{ matrix.config.static }}) ==="
             STATIC_FLAG=""
             NTBTLS_FLAG=""
+            GNUPG_LDFLAGS=""
             if [ "${{ matrix.config.static }}" = "1" ]; then
               STATIC_FLAG="STATIC=1"
               NTBTLS_FLAG='speedo_pkg_ntbtls_configure=--disable-shared'
+              # Static libgpg-error.a references Winsock symbols
+              # (inet_addr, socket, connect, closesocket) that
+              # libtool can't propagate through .a files.
+              # gnupg configure.ac already sets W32SOCKLIBS=-lws2_32
+              # for dynamic builds; for static, pass it explicitly.
+              GNUPG_LDFLAGS='speedo_pkg_gnupg_make_args=LIBS=-lws2_32'
             fi
             make -f build-aux/speedo.mk \
               TARGETOS=w32 WHAT=release UPD_SWDB=1 ${STATIC_FLAG} \
               W32VERSION=${{ matrix.config.w32version }} \
               ${NTBTLS_FLAG} \
+              ${GNUPG_LDFLAGS} \
               all
           else
             echo "=== Linux 静态编译 ==="
