@@ -3,7 +3,7 @@ name: GnuPG 自动构建
 on:
   schedule:
     # 每天 UTC 0:00 = 北京时间 8:00
-    - cron: '0 4 * * *'
+    - cron: '0 3 * * *'
   workflow_dispatch:
 
 env:
