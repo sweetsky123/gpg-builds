@@ -6,7 +6,6 @@ GnuPG Version Checker
 """
 
 import json
-import re
 import sys
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen
@@ -250,6 +249,9 @@ def main():
             "w32_tarball_name": info["gnupg_stable_with_libs"]["tarball_name"] if info["gnupg_stable_with_libs"] else "",
             "dependencies": info["dependencies"],
         }
+        # 同时写入文件供后续 job 使用
+        with open("version_info.json", "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
         print(json.dumps(output, indent=2, ensure_ascii=False))
         return 0
 
